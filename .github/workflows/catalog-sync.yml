@@ -1,0 +1,88 @@
+name: Sync Catalog images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Vashti_foto/**'
+      - '.github/workflows/catalog-sync.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: catalog-image-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+    steps:
+      - name: Read image file versions from the pushed commit
+        run: |
+          git init -q
+          git remote add origin https://github.com/Prochure/vashti_foto.git
+          git -c remote.origin.promisor=true fetch --quiet --filter=blob:none --depth=1 origin "$GITHUB_SHA"
+          git ls-tree -z "$GITHUB_SHA:Vashti_foto" > image-tree
+      - name: Send image versions to Catalog and finish synchronization
+        run: |
+          node --input-type=module <<'NODE'
+          import {readFileSync} from 'node:fs';
+          import {setTimeout as delay} from 'node:timers/promises';
+
+          const endpoint = 'https://catalog.vashtifashion.com.br/api/catalog';
+          const audience = endpoint + '/github';
+          const images = [];
+          for (const entry of readFileSync('image-tree', 'utf8').split('\0')) {
+            const match = /^100[67][0-7]{2} blob ([a-f0-9]{40})\t([^/\\\x00-\x1f]+\.(?:jpe?g|png|webp|avif|gif))$/i.exec(entry);
+            if (match) images.push({filename: match[2], sha: match[1]});
+          }
+          if (!images.length) throw new Error('The image index is empty');
+
+          const identityUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          identityUrl.searchParams.set('audience', audience);
+          const identity = await fetch(identityUrl, {
+            headers: {Authorization: 'Bearer ' + process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN},
+            signal: AbortSignal.timeout(15000),
+          });
+          if (!identity.ok) throw new Error('GitHub identity request failed: ' + identity.status);
+          const {value: token} = await identity.json();
+          const index = await fetch(audience, {
+            method: 'POST',
+            headers: {Authorization: 'Bearer ' + token, 'Content-Type': 'application/json'},
+            body: JSON.stringify(images),
+            signal: AbortSignal.timeout(30000),
+          });
+          if (!index.ok) throw new Error('Catalog image index failed: ' + index.status);
+          const registration = await index.json();
+          if (registration.status === 'superseded') process.exit(0);
+          console.log('Registered ' + images.length + ' image files');
+
+          const deadline = Date.now() + 720000;
+          let failures = 0;
+          while (Date.now() < deadline) {
+            const response = await fetch(endpoint, {method: 'POST', signal: AbortSignal.timeout(45000)}).catch(() => null);
+            if (response?.status === 200) {
+              const result = await response.json();
+              if (['published', 'unchanged'].includes(result.status) && result.version) {
+                console.log('Catalog ' + result.status + ': ' + result.version + ' (' + result.productCount + ' products)');
+                process.exit(0);
+              }
+            }
+            if (response?.status === 202) {
+              failures = 0;
+              const progress = await response.json();
+              if (progress.totalImages) console.log('Processed ' + progress.stagedImages + ' of ' + progress.totalImages);
+              await delay(1200);
+            } else if ((!response || [429, 500, 502, 503, 504].includes(response.status)) && ++failures <= 6) {
+              await delay(3000 * failures);
+            } else {
+              throw new Error('Catalog synchronization failed: ' + (response?.status ?? 'network error'));
+            }
+          }
+          throw new Error('Catalog synchronization did not finish before the deadline');
+          NODE
